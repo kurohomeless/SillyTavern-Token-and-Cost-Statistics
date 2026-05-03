@@ -15,12 +15,15 @@ import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 import { getChatCompletionModel, oai_settings } from '../../../openai.js';
 import { textgenerationwebui_settings as textgen_settings } from '../../../textgen-settings.js';
+import { pricing } from './dict.js';
 
 const extensionName = 'token-usage-tracker';
 
 const defaultSettings = {
     showInTopBar: true,
     modelColors: {}, // { "gpt-4o": "#6366f1", "claude-3-opus": "#8b5cf6", ... }
+    // Prices per 1M tokens: { "gpt-4o": { in: 2.5, out: 10 }, ... }
+    modelPrices: {},
     // Accumulated usage data
     usage: {
         session: { input: 0, output: 0, total: 0, messageCount: 0, startTime: null },
@@ -57,6 +60,28 @@ function loadSettings() {
     if (!settings.usage.byMonth) settings.usage.byMonth = {};
     if (!settings.usage.byChat) settings.usage.byChat = {};
     if (!settings.usage.byModel) settings.usage.byModel = {};
+
+    // Initialize modelPrices
+    if (!settings.modelPrices) settings.modelPrices = {};
+
+    // Migration: Convert byDay.models from numeric format to object format
+    // Old: models[modelId] = totalTokens (number)
+    // New: models[modelId] = { input, output, total }
+    for (const dayData of Object.values(settings.usage.byDay)) {
+        if (dayData.models) {
+            for (const [modelId, value] of Object.entries(dayData.models)) {
+                if (typeof value === 'number') {
+                    // Migrate: estimate input/output using day's ratio
+                    const ratio = dayData.total ? value / dayData.total : 0;
+                    dayData.models[modelId] = {
+                        input: Math.round((dayData.input || 0) * ratio),
+                        output: Math.round((dayData.output || 0) * ratio),
+                        total: value,
+                    };
+                }
+            }
+        }
+    }
 
     // Initialize session start time
     if (!settings.usage.session.startTime) {
@@ -208,10 +233,16 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null) {
     if (!usage.byDay[dayKey]) usage.byDay[dayKey] = { input: 0, output: 0, total: 0, messageCount: 0, models: {} };
     addTokens(usage.byDay[dayKey]);
 
-    // Track model within day for stacked chart
+    // Track model within day for stacked chart (with input/output breakdown for cost calculation)
     if (modelId) {
         if (!usage.byDay[dayKey].models) usage.byDay[dayKey].models = {};
-        usage.byDay[dayKey].models[modelId] = (usage.byDay[dayKey].models[modelId] || 0) + totalTokens;
+        if (!usage.byDay[dayKey].models[modelId]) {
+            usage.byDay[dayKey].models[modelId] = { input: 0, output: 0, total: 0 };
+        }
+        const modelData = usage.byDay[dayKey].models[modelId];
+        modelData.input += inputTokens;
+        modelData.output += outputTokens;
+        modelData.total += totalTokens;
     }
 
     // By hour
@@ -368,9 +399,8 @@ async function countInputTokens(generate_data) {
         // For text completion APIs (kobold, novel, textgen) - prompt is a string
         if (typeof generate_data.prompt === 'string') {
             inputTokens = await countTokens(generate_data.prompt);
-        }
-        // For chat completion APIs (OpenAI) - prompt is an array of messages
-        else if (Array.isArray(generate_data.prompt)) {
+        } else if (Array.isArray(generate_data.prompt)) {
+            // For chat completion APIs (OpenAI) - prompt is an array of messages
             for (const message of generate_data.prompt) {
                 if (message.content) {
                     // Content can be a string or an array of content parts (for multimodal)
@@ -723,6 +753,388 @@ function formatNumberFull(num) {
 }
 
 /**
+ * Normalize model IDs for compatibility matching.
+ * Handles case and punctuation variants while preserving semantic version differences.
+ * @param {string} modelId
+ * @returns {string}
+ */
+function normalizeModelIdForLookup(modelId) {
+    if (!modelId) return '';
+
+    let normalized = String(modelId).trim().toLowerCase();
+
+    // Strip live-stat suffixes (" | 14:12 | ...") and normalize version delimiters.
+    normalized = normalized.split('|')[0].trim();
+    normalized = normalized.replace(/(\d)[\s._/-]+(?=\d)/g, '$1');
+
+    // Split words and numbers for IDs like "qwen3.6-plus" vs "Qwen 3.6 Plus".
+    normalized = normalized.replace(/([a-z])(\d)/g, '$1 $2');
+    normalized = normalized.replace(/(\d)([a-z])/g, '$1 $2');
+
+    normalized = normalized.replace(/[:/]+/g, ' ');
+    normalized = normalized.replace(/[\s._-]+/g, ' ');
+    normalized = normalized.replace(/\s+/g, ' ').trim();
+
+    return normalized;
+}
+
+/**
+ * Build candidate lookup forms for model ID matching.
+ * @param {string} modelId
+ * @returns {string[]}
+ */
+function getModelLookupCandidates(modelId) {
+    const raw = String(modelId || '').trim();
+    if (!raw) return [];
+
+    const candidates = new Set();
+    const suffixPattern = /(?:[\s._:-]+)(?:it|instruct|chat|thinking|reasoning|agentic|free)$/i;
+    const addCandidate = (value) => {
+        const trimmed = String(value || '').trim();
+        if (!trimmed) return;
+        candidates.add(trimmed);
+
+        // Add progressively stripped terminal tags ("-it", ":free", "-thinking", etc).
+        let variant = trimmed;
+        while (true) {
+            const stripped = variant.replace(suffixPattern, '').trim();
+            if (!stripped || stripped === variant) break;
+            candidates.add(stripped);
+            variant = stripped;
+        }
+    };
+
+    addCandidate(raw);
+    const beforePipe = raw.split('|')[0].trim();
+    addCandidate(beforePipe);
+
+    if (beforePipe.includes('/')) {
+        const tail = beforePipe.split('/').filter(Boolean).pop();
+        addCandidate(tail);
+    }
+
+    if (beforePipe.includes(':')) {
+        const tail = beforePipe.split(':').filter(Boolean).pop();
+        addCandidate(tail);
+    }
+
+    const withoutParens = beforePipe.replace(/\([^)]*\)/g, '').trim();
+    addCandidate(withoutParens);
+
+    return [...candidates];
+}
+
+/**
+ * Build normalized lookup map for a pricing dictionary.
+ * @param {Record<string, {in: number, out: number}>} priceMap
+ * @returns {Map<string, string>}
+ */
+function buildNormalizedPriceLookupMap(priceMap) {
+    const normalizedMap = new Map();
+    const getPriority = (key) => /:free$/i.test(key) ? 0 : 1;
+    for (const key of Object.keys(priceMap || {})) {
+        const candidates = getModelLookupCandidates(key);
+        for (const candidate of candidates) {
+            const normalized = normalizeModelIdForLookup(candidate);
+            if (!normalized) continue;
+
+            if (!normalizedMap.has(normalized)) {
+                normalizedMap.set(normalized, key);
+                continue;
+            }
+
+            const existingKey = normalizedMap.get(normalized);
+            if (existingKey && getPriority(key) > getPriority(existingKey)) {
+                normalizedMap.set(normalized, key);
+            }
+        }
+    }
+    return normalizedMap;
+}
+
+const LOOKUP_STOPWORDS = new Set([
+    'it', 'instruct', 'chat', 'thinking', 'reasoning', 'agentic', 'free',
+    'preview', 'customtools', 'customtool', 'tools', 'tool', 'gguf', 'ud',
+]);
+
+const LOOKUP_QUALIFIERS = new Set([
+    'preview', 'customtools', 'customtool', 'thinking', 'reasoning', 'agentic',
+    'image', 'vision', 'audio', 'search', 'fast', 'lite', 'mini', 'beta', 'exp',
+]);
+
+const LOOKUP_TOKEN_SYNONYMS = {
+    expert: 'pro',
+};
+
+function tokenizeModelIdForLookup(modelId) {
+    let value = String(modelId || '').toLowerCase();
+    value = value.split('|')[0].trim();
+    value = value.replace(/([a-z])(\d)/g, '$1 $2');
+    value = value.replace(/(\d)([a-z])/g, '$1 $2');
+    value = value.replace(/[^\w]+/g, ' ');
+    const tokens = value.split(/\s+/).filter(Boolean);
+
+    const result = [];
+    for (const tokenRaw of tokens) {
+        let token = tokenRaw.toLowerCase();
+        if (/^\d{5,}$/.test(token)) continue; // date/build identifiers
+        if (/^iq\d+[a-z]*$/.test(token)) continue; // quantization labels
+        if (LOOKUP_STOPWORDS.has(token)) continue;
+        token = LOOKUP_TOKEN_SYNONYMS[token] || token;
+        if (!token || LOOKUP_STOPWORDS.has(token)) continue;
+        if (token.length <= 1) continue;
+        result.push(token);
+    }
+
+    return [...new Set(result)];
+}
+
+function extractVersionInfo(modelId) {
+    const composite = new Set();
+    const major = new Set();
+    const value = String(modelId || '').toLowerCase();
+
+    const compositeRegex = /(^|[^0-9])(\d+(?:[._-]\d+)+)(?=$|[^0-9])/g;
+    let match;
+    while ((match = compositeRegex.exec(value)) !== null) {
+        const raw = match[2];
+        const parts = raw.split(/[._-]+/).filter(Boolean);
+        if (parts.length < 2) continue;
+        while (parts.length > 2 && parts[parts.length - 1].length >= 4) {
+            parts.pop();
+        }
+        if (parts.length < 2) continue;
+        if (parts.slice(0, 2).some(p => p.length >= 4)) continue; // likely date-only token chain
+        const majorPart = String(Number.parseInt(parts[0], 10));
+        const minorPart = String(Number.parseInt(parts[1], 10));
+        if (!Number.isFinite(Number(majorPart)) || !Number.isFinite(Number(minorPart))) continue;
+        composite.add(`${majorPart}.${minorPart}`);
+        major.add(majorPart);
+    }
+
+    const majorRegex = /(^|[^0-9a-z])(\d{1,2})(?=$|[^0-9a-z])/g;
+    while ((match = majorRegex.exec(value)) !== null) {
+        const part = String(Number.parseInt(match[2], 10));
+        if (Number.isFinite(Number(part))) {
+            major.add(part);
+        }
+    }
+
+    return { composite, major };
+}
+
+function extractLookupQualifiers(modelId) {
+    let value = String(modelId || '').toLowerCase();
+    value = value.split('|')[0].trim();
+    value = value.replace(/([a-z])(\d)/g, '$1 $2');
+    value = value.replace(/(\d)([a-z])/g, '$1 $2');
+    value = value.replace(/[^\w]+/g, ' ');
+    const qualifiers = new Set();
+    for (const token of value.split(/\s+/).filter(Boolean)) {
+        if (LOOKUP_QUALIFIERS.has(token)) {
+            qualifiers.add(token);
+        }
+    }
+    return qualifiers;
+}
+
+function getMaxCompositeVersion(composites) {
+    let max = 0;
+    for (const composite of composites) {
+        const [majorPart, minorPart] = composite.split('.');
+        const major = Number.parseInt(majorPart, 10);
+        const minor = Number.parseInt(minorPart, 10);
+        if (!Number.isFinite(major) || !Number.isFinite(minor)) continue;
+        const rank = (major * 1000) + minor;
+        if (rank > max) max = rank;
+    }
+    return max;
+}
+
+function buildLookupProfile(modelId) {
+    const tokenList = tokenizeModelIdForLookup(modelId);
+    const tokenSet = new Set(tokenList);
+    const version = extractVersionInfo(modelId);
+    const qualifiers = extractLookupQualifiers(modelId);
+    const source = String(modelId || '').toLowerCase();
+    const vendor = source.includes('/') ? source.split('/')[0] : '';
+    return {
+        modelId,
+        tokenList,
+        tokenSet,
+        vendor,
+        qualifiers,
+        compositeVersions: version.composite,
+        majorVersions: version.major,
+        maxCompositeVersion: getMaxCompositeVersion(version.composite),
+        isFree: /:free$/i.test(modelId),
+    };
+}
+
+function hasIntersection(a, b) {
+    for (const value of a) {
+        if (b.has(value)) return true;
+    }
+    return false;
+}
+
+function semanticMatchScore(queryProfile, targetProfile) {
+    const querySize = queryProfile.tokenList.length;
+    if (querySize === 0) return Number.NEGATIVE_INFINITY;
+
+    let common = 0;
+    for (const token of queryProfile.tokenList) {
+        if (targetProfile.tokenSet.has(token)) common++;
+    }
+    if (common === 0) return Number.NEGATIVE_INFINITY;
+    if (querySize > 1 && common < 2) return Number.NEGATIVE_INFINITY;
+
+    const precision = common / querySize;
+    if (precision < 0.5) return Number.NEGATIVE_INFINITY;
+
+    if (queryProfile.compositeVersions.size > 0) {
+        if (!hasIntersection(queryProfile.compositeVersions, targetProfile.compositeVersions)) {
+            return Number.NEGATIVE_INFINITY;
+        }
+    } else if (queryProfile.majorVersions.size > 0) {
+        if (!hasIntersection(queryProfile.majorVersions, targetProfile.majorVersions)) {
+            return Number.NEGATIVE_INFINITY;
+        }
+    }
+
+    let score = (common * 10) + (precision * 5) - (targetProfile.tokenList.length - common);
+    if (queryProfile.vendor && targetProfile.vendor && queryProfile.vendor === targetProfile.vendor) {
+        score += 2;
+    }
+    let qualifierPenalty = 0;
+    for (const qualifier of targetProfile.qualifiers) {
+        if (!queryProfile.qualifiers.has(qualifier)) {
+            qualifierPenalty += 1;
+        }
+    }
+    score -= qualifierPenalty * 2;
+    if (targetProfile.isFree) {
+        score -= 1;
+    }
+    score += targetProfile.maxCompositeVersion / 1000000;
+    return score;
+}
+
+function resolveSemanticPriceMatch(lookupCandidates) {
+    let best = null;
+
+    for (const candidate of lookupCandidates) {
+        const queryProfile = buildLookupProfile(candidate);
+        for (const targetProfile of openRouterPriceProfiles) {
+            const score = semanticMatchScore(queryProfile, targetProfile);
+            if (!Number.isFinite(score)) continue;
+
+            const scored = { score, key: targetProfile.modelId };
+            if (!best) {
+                best = scored;
+                continue;
+            }
+
+            if (score > best.score) {
+                best = scored;
+                continue;
+            }
+
+            if (score === best.score && scored.key.localeCompare(best.key) < 0) {
+                best = scored;
+            }
+        }
+    }
+
+    if (!best) return null;
+    return best.key;
+}
+
+const openRouterNormalizedPriceLookupMap = buildNormalizedPriceLookupMap(pricing);
+const openRouterPriceProfiles = Object.keys(pricing).map(buildLookupProfile);
+let manualNormalizedPriceLookupMap = null;
+
+/**
+ * Sanitize and validate a price object.
+ * @param {any} price
+ * @returns {{in: number, out: number}|null}
+ */
+function parsePriceObject(price) {
+    if (!price || typeof price !== 'object') return null;
+    const input = Number.parseFloat(price.in);
+    const output = Number.parseFloat(price.out);
+    if (!Number.isFinite(input) || !Number.isFinite(output) || input < 0 || output < 0) {
+        return null;
+    }
+    return { in: input, out: output };
+}
+
+/**
+ * Resolve model price using exact + normalized matching with manual override priority.
+ * @param {string} modelId
+ * @returns {{resolved: boolean, in: number|null, out: number|null, source: string|null, matchedModelId: string|null}}
+ */
+function resolveModelPrice(modelId) {
+    const settings = getSettings();
+    const manualPrices = settings.modelPrices || {};
+    const lookupCandidates = getModelLookupCandidates(modelId);
+    if (!manualNormalizedPriceLookupMap) {
+        manualNormalizedPriceLookupMap = buildNormalizedPriceLookupMap(manualPrices);
+    }
+
+    // 1) Manual exact
+    if (Object.prototype.hasOwnProperty.call(manualPrices, modelId)) {
+        const parsed = parsePriceObject(manualPrices[modelId]);
+        if (parsed) {
+            return { resolved: true, ...parsed, source: 'manual-exact', matchedModelId: modelId };
+        }
+    }
+
+    // 2) Manual normalized
+    for (const candidate of lookupCandidates) {
+        const normalized = normalizeModelIdForLookup(candidate);
+        const matched = manualNormalizedPriceLookupMap.get(normalized);
+        if (matched) {
+            const parsed = parsePriceObject(manualPrices[matched]);
+            if (parsed) {
+                return { resolved: true, ...parsed, source: 'manual-normalized', matchedModelId: matched };
+            }
+        }
+    }
+
+    // 3) Built-in exact
+    if (Object.prototype.hasOwnProperty.call(pricing, modelId)) {
+        const parsed = parsePriceObject(pricing[modelId]);
+        if (parsed) {
+            return { resolved: true, ...parsed, source: 'openrouter-exact', matchedModelId: modelId };
+        }
+    }
+
+    // 4) Built-in normalized
+    for (const candidate of lookupCandidates) {
+        const normalized = normalizeModelIdForLookup(candidate);
+        const matched = openRouterNormalizedPriceLookupMap.get(normalized);
+        if (matched) {
+            const parsed = parsePriceObject(pricing[matched]);
+            if (parsed) {
+                return { resolved: true, ...parsed, source: 'openrouter-normalized', matchedModelId: matched };
+            }
+        }
+    }
+
+    // 5) Semantic fallback (token/version aware)
+    const semanticMatch = resolveSemanticPriceMatch(lookupCandidates);
+    if (semanticMatch && Object.prototype.hasOwnProperty.call(pricing, semanticMatch)) {
+        const parsed = parsePriceObject(pricing[semanticMatch]);
+        if (parsed) {
+            return { resolved: true, ...parsed, source: 'openrouter-semantic', matchedModelId: semanticMatch };
+        }
+    }
+
+    return { resolved: false, in: null, out: null, source: null, matchedModelId: null };
+}
+
+/**
  * Generate a random color using HSL for guaranteed distinctness
  * Colors are persisted once assigned to maintain consistency
  * @param {string} modelId - Model identifier
@@ -809,6 +1221,70 @@ function setModelColor(modelId, color) {
     saveSettings();
 }
 
+/**
+ * Get price settings for a model
+ * @param {string} modelId
+ * @returns {{in: number|null, out: number|null, resolved: boolean, source: string|null, matchedModelId: string|null}}
+ */
+function getModelPrice(modelId) {
+    return resolveModelPrice(modelId);
+}
+
+/**
+ * Set price settings for a model
+ * @param {string} modelId
+ * @param {number} priceIn - Price per 1M input tokens
+ * @param {number} priceOut - Price per 1M output tokens
+ */
+function setModelPrice(modelId, priceIn, priceOut) {
+    const settings = getSettings();
+    const normalizePrice = (value) => {
+        const parsed = Number.parseFloat(value);
+        if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+        return parsed < 0.001 ? 0.001 : parsed;
+    };
+    settings.modelPrices[modelId] = {
+        in: normalizePrice(priceIn),
+        out: normalizePrice(priceOut),
+    };
+    manualNormalizedPriceLookupMap = null;
+    saveSettings();
+}
+
+/**
+ * Calculate cost for a given token usage and model
+ * @param {number} inputTokens
+ * @param {number} outputTokens
+ * @param {string} modelId
+ * @returns {number} Cost in dollars
+ */
+function calculateCost(inputTokens, outputTokens, modelId) {
+    if ((inputTokens || 0) <= 0 && (outputTokens || 0) <= 0) return 0;
+
+    const prices = resolveModelPrice(modelId);
+    if (!prices.resolved || prices.in === null || prices.out === null) return 0;
+
+    const inputCost = (inputTokens / 1000000) * prices.in;
+    const outputCost = (outputTokens / 1000000) * prices.out;
+    return inputCost + outputCost;
+}
+
+/**
+ * Calculate all-time cost using the byModel aggregation which has precise input/output counts
+ */
+function calculateAllTimeCost() {
+    const settings = getSettings();
+    const byModel = settings.usage.byModel;
+    let total = 0;
+
+    for (const [modelId, data] of Object.entries(byModel)) {
+        const inputTokens = data.input || 0;
+        const outputTokens = data.output || 0;
+        const cost = calculateCost(inputTokens, outputTokens, modelId);
+        total += cost || 0;
+    }
+    return total;
+}
 
 // Chart state
 let currentChartRange = 30;
@@ -820,10 +1296,10 @@ const CHART_COLORS = {
     bar: 'var(--SmartThemeBorderColor)',
     text: 'var(--SmartThemeBodyColor)',
     grid: 'var(--SmartThemeBorderColor)',
-    cursor: 'var(--SmartThemeQuoteColor)'
+    cursor: 'var(--SmartThemeBodyColor)',
 };
 
-const SVG_NS = "http://www.w3.org/2000/svg";
+const SVG_NS = 'http://www.w3.org/2000/svg';
 
 function createSVGElement(type, attrs = {}) {
     const el = document.createElementNS(SVG_NS, type);
@@ -856,7 +1332,7 @@ function getChartData(days) {
             output: dayData.output || 0,
             models: dayData.models || {},
             displayDate: new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(date),
-            fullDate: new Intl.DateTimeFormat('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }).format(date)
+            fullDate: new Intl.DateTimeFormat('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }).format(date),
         });
     }
     return data;
@@ -888,7 +1364,7 @@ function renderChart() {
         width: width,
         height: height,
         viewBox: `0 0 ${width} ${height}`,
-        style: 'display: block; max-width: 100%;'
+        style: 'display: block; max-width: 100%;',
     });
 
 
@@ -929,7 +1405,7 @@ function renderChart() {
             y2: y,
             stroke: CHART_COLORS.grid,
             'stroke-width': '1',
-            'stroke-dasharray': '4 4'
+            'stroke-dasharray': '4 4',
         });
         gridGroup.appendChild(line);
 
@@ -939,7 +1415,7 @@ function renderChart() {
             'text-anchor': 'end',
             fill: CHART_COLORS.text,
             'font-size': '10',
-            'font-family': 'ui-sans-serif, system-ui, sans-serif'
+            'font-family': 'ui-sans-serif, system-ui, sans-serif',
         });
         text.textContent = formatTokens(val);
         textGroup.appendChild(text);
@@ -967,7 +1443,7 @@ function renderChart() {
             fill: 'transparent',
             opacity: '0.1',
             class: 'cursor-rect',
-            style: 'cursor: pointer;'
+            style: 'cursor: pointer;',
         });
 
         cursor.addEventListener('mouseenter', () => {
@@ -998,11 +1474,14 @@ function renderChart() {
 
         // Draw filled segments for each model
         if (d.models && Object.keys(d.models).length > 0 && d.usage > 0) {
-            const modelEntries = Object.entries(d.models).sort((a, b) => b[1] - a[1]); // Sort by usage desc
+            // Extract total from new object format or use number directly for legacy
+            const getTokens = (v) => typeof v === 'number' ? v : (v.total || 0);
+            const modelEntries = Object.entries(d.models).sort((a, b) => getTokens(b[1]) - getTokens(a[1])); // Sort by usage desc
 
             let cumulativeY = barY + h; // Start from bottom
 
-            for (const [modelId, tokens] of modelEntries) {
+            for (const [modelId, modelData] of modelEntries) {
+                const tokens = getTokens(modelData);
                 const segmentHeight = (tokens / d.usage) * h;
                 const segmentY = cumulativeY - segmentHeight;
 
@@ -1031,7 +1510,7 @@ function renderChart() {
                     fill: color,
                     opacity: '1',
                     'shape-rendering': 'geometricPrecision',
-                    'pointer-events': 'none'
+                    'pointer-events': 'none',
                 });
                 barGroup.appendChild(segment);
 
@@ -1046,7 +1525,7 @@ function renderChart() {
             stroke: CHART_COLORS.bar,
             'stroke-width': '1.5',
             'shape-rendering': 'geometricPrecision',
-            'pointer-events': 'none'
+            'pointer-events': 'none',
         });
         barGroup.appendChild(outerPath);
 
@@ -1060,7 +1539,7 @@ function renderChart() {
                 fill: CHART_COLORS.text,
                 opacity: '0.6',
                 'font-size': '10',
-                'font-family': 'ui-sans-serif, system-ui, sans-serif'
+                'font-family': 'ui-sans-serif, system-ui, sans-serif',
             });
             label.textContent = d.displayDate;
             textGroup.appendChild(label);
@@ -1076,10 +1555,13 @@ function showTooltip(d) {
     // Build model breakdown HTML
     let modelBreakdown = '';
     if (d.models && Object.keys(d.models).length > 0) {
-        const modelEntries = Object.entries(d.models).sort((a, b) => a[1] - b[1]); // Sort ascending (smallest first, like graph bottom-up)
+        // Extract total from new object format or use number directly for legacy
+        const getTokens = (v) => typeof v === 'number' ? v : (v.total || 0);
+        const modelEntries = Object.entries(d.models).sort((a, b) => getTokens(a[1]) - getTokens(b[1])); // Sort ascending (smallest first, like graph bottom-up)
         modelBreakdown = '<div style="margin-top: 4px; padding-top: 4px; border-top: 1px solid rgba(255,255,255,0.2);">';
         const displayEntries = modelEntries.slice(-8); // Show last 8 (the largest)
-        for (const [model, tokens] of displayEntries) {
+        for (const [model, modelData] of displayEntries) {
+            const tokens = getTokens(modelData);
             const percent = d.usage > 0 ? Math.round((tokens / d.usage) * 100) : 0;
             const shortName = model.length > 25 ? model.substring(0, 22) + '...' : model;
             const color = getModelColor(model);
@@ -1099,7 +1581,7 @@ function showTooltip(d) {
 
     tooltip.innerHTML = `
         <div style="font-weight: 600; margin-bottom: 2px; color: var(--SmartThemeBodyColor);">${d.fullDate}</div>
-        <div style="color: var(--SmartThemeQuoteColor);">${formatNumberFull(d.usage)} tokens</div>
+        <div style="color: var(--SmartThemeBodyColor);">${formatNumberFull(d.usage)} tokens</div>
         <div style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.6;">${formatNumberFull(d.input)} in / ${formatNumberFull(d.output)} out</div>
         ${modelBreakdown}
     `;
@@ -1161,6 +1643,7 @@ function updateChartRange(range) {
  */
 function updateUIStats() {
     const stats = getUsageStats();
+    const now = new Date();
 
     // Today header
     $('#token-usage-today-total').text(formatTokens(stats.today.total));
@@ -1171,6 +1654,59 @@ function updateUIStats() {
     $('#token-usage-week-total').text(formatTokens(stats.thisWeek.total));
     $('#token-usage-month-total').text(formatTokens(stats.thisMonth.total));
     $('#token-usage-alltime-total').text(formatTokens(stats.allTime.total));
+
+    // Cost calculations
+    const allTimeCost = calculateAllTimeCost();
+    $('#token-usage-alltime-cost').text(`$${allTimeCost.toFixed(2)}`);
+
+    // For Week/Month: We iterate all `byDay` keys and match those that belong to current week/month
+    const currentWeekKey = getWeekKey(now);
+    const currentMonthKey = getMonthKey(now);
+    const todayKey = getDayKey(now);
+
+    let weekCost = 0;
+    let monthCost = 0;
+    let todayCost = 0;
+
+    const settings = getSettings();
+    for (const [dayKey, data] of Object.entries(settings.usage.byDay)) {
+        // Parse dayKey (YYYY-MM-DD) as local date, not UTC
+        // new Date("2026-01-01") interprets as UTC, which shifts timezone
+        const [year, month, day] = dayKey.split('-').map(Number);
+        const date = new Date(year, month - 1, day);
+
+        // Week check
+        if (getWeekKey(date) === currentWeekKey) {
+            // Calculate cost for this day using per-model input/output breakdown
+            if (data.models) {
+                for (const [mid, modelData] of Object.entries(data.models)) {
+                    // modelData is now { input, output, total } (or number for legacy data)
+                    const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
+                    const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
+                    const cost = calculateCost(mInput, mOutput, mid);
+                    weekCost += cost || 0;
+                    if (dayKey === todayKey) {
+                        todayCost += cost || 0;
+                    }
+                }
+            }
+        }
+        // Month check
+        if (getMonthKey(date) === currentMonthKey) {
+            if (data.models) {
+                for (const [mid, modelData] of Object.entries(data.models)) {
+                    const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
+                    const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
+                    const cost = calculateCost(mInput, mOutput, mid);
+                    monthCost += cost || 0;
+                }
+            }
+        }
+    }
+
+    $('#token-usage-week-cost').text(`$${weekCost.toFixed(2)}`);
+    $('#token-usage-month-cost').text(`$${monthCost.toFixed(2)}`);
+    $('#token-usage-today-cost').text(`$${todayCost.toFixed(2)}`);
 
     $('#token-usage-tokenizer').text('Tokenizer: ' + (stats.tokenizer || 'Unknown'));
 
@@ -1184,36 +1720,77 @@ function updateUIStats() {
 
 
 /**
- * Render the model colors grid
+ * Render the model colors grid with price inputs
  */
 function renderModelColorsGrid() {
     const grid = $('#token-usage-model-colors-grid');
     if (grid.length === 0) return;
 
-    grid.empty();
-
     const stats = getUsageStats();
     const models = Object.keys(stats.byModel || {}).sort();
 
     if (models.length === 0) {
-        grid.append('<div style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.5; padding: 8px; grid-column: 1 / -1; text-align: center;">No models tracked yet</div>');
+        grid.empty().append('<div style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.5; padding: 8px; text-align: center;">No models tracked yet</div>');
         return;
     }
 
+    // If grid is already populated with the same models, don't wipe it (prevents input focus loss)
+    const existingRows = grid.children('.model-config-row');
+    if (existingRows.length === models.length) {
+        // Assume same order check isn't needed for now, unlikely to change order rapidly
+        return;
+    }
+
+    grid.empty();
+
+    const formatPriceForInput = (value) => {
+        if (value === null || value === undefined || Number.isNaN(value)) return '';
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return '';
+        if (numeric > 0 && numeric < 0.001) return '0.001';
+        const rounded = numeric.toFixed(3);
+        if (numeric > 0 && rounded === '0.000') return '0.001';
+        return rounded.replace(/\.?0+$/, '');
+    };
+
     for (const model of models) {
         const color = getModelColor(model);
+        const prices = getModelPrice(model);
+        const inputValue = formatPriceForInput(prices.in);
+        const outputValue = formatPriceForInput(prices.out);
 
         const row = $(`
-            <div style="display: flex; align-items: center; gap: 4px; min-width: 0;">
+            <div class="model-config-row" style="display: flex; align-items: center; gap: 4px; min-width: 0;">
                 <input type="color" value="${color}" data-model="${model}"
+                       class="model-color-picker"
                        style="width: 20px; height: 20px; padding: 0; border: none; cursor: pointer; flex-shrink: 0; border-radius: 4px;">
                 <span title="${model}" style="font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--SmartThemeBodyColor); flex: 1;">${model}</span>
+                <span style="font-size: 8px; color: var(--SmartThemeBodyColor); opacity: 0.5; flex-shrink: 0;">Price</span>
+                <input type="number" class="price-input-in" data-model="${model}" value="${inputValue}" step="0.001" min="0" placeholder="In" title="Price per 1M input tokens" style="width: 32px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0;">
+                <input type="number" class="price-input-out" data-model="${model}" value="${outputValue}" step="0.001" min="0" placeholder="Out" title="Price per 1M output tokens" style="width: 32px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0;">
             </div>
         `);
 
-        row.find('input[type="color"]').on('change', function() {
+        // Color picker handler
+        row.find('.model-color-picker').on('change', function () {
             setModelColor(String($(this).data('model')), String($(this).val()));
-            renderChart(); // Re-render with new colors
+            renderChart();
+        });
+
+        // Price input handlers with debounce
+        let debounceTimer;
+        const handlePriceChange = () => {
+            const mId = model; // closure
+            const pIn = row.find('.price-input-in').val();
+            const pOut = row.find('.price-input-out').val();
+            setModelPrice(mId, pIn, pOut);
+            // Trigger UI update to recalc costs
+            updateUIStats();
+        };
+
+        row.find('input[type="number"]').on('input', function () {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(handlePriceChange, 500);
         });
 
         grid.append(row);
@@ -1224,7 +1801,6 @@ function renderModelColorsGrid() {
  * Create the settings UI in the extensions panel
  */
 function createSettingsUI() {
-    const settings = getSettings();
     const stats = getUsageStats();
 
     const html = `
@@ -1238,8 +1814,11 @@ function createSettingsUI() {
                     <!-- Chart Header: Today stats + Range selector -->
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                         <div>
-                            <span style="font-size: 18px; font-weight: 600; color: var(--SmartThemeQuoteColor);" id="token-usage-today-total">${formatTokens(stats.today.total)}</span>
-                            <span style="font-size: 11px; color: var(--SmartThemeBodyColor); opacity: 0.5;"> today</span>
+                            <div style="display: flex; align-items: baseline; gap: 6px;">
+                                <span style="font-size: 18px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-today-total">${formatTokens(stats.today.total)}</span>
+                                <span id="token-usage-today-cost" style="font-size: 12px; color: var(--SmartThemeBodyColor); opacity: 0.8;">$0.00</span>
+                                <span style="font-size: 11px; color: var(--SmartThemeBodyColor); opacity: 0.5;"> today</span>
+                            </div>
                             <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.4;">
                                 <span id="token-usage-today-in">${formatTokens(stats.today.input || 0)}</span> in /
                                 <span id="token-usage-today-out">${formatTokens(stats.today.output || 0)}</span> out
@@ -1257,30 +1836,42 @@ function createSettingsUI() {
 
                     <!-- Stats Grid (Week, Month, All Time) -->
                     <div class="token-usage-stats-grid" style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 10px;">
-                        <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); padding: 6px 8px; border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor);">
-                            <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">This Week</div>
-                            <div style="font-size: 16px; font-weight: 600; color: var(--SmartThemeBodyColor);">
-                                <span id="token-usage-week-total">${formatTokens(stats.thisWeek.total)}</span>
+                        <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); overflow: hidden; display: flex;">
+                            <div style="flex: 1; padding: 4px 8px;">
+                                <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">This Week</div>
+                                <div style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-week-total">${formatTokens(stats.thisWeek.total)}</div>
+                            </div>
+                            <div style="width: 1px; background: var(--SmartThemeBorderColor);"></div>
+                            <div style="flex: 1; padding: 4px 8px; display: flex; align-items: center; justify-content: center;">
+                                <span style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-week-cost">$0.00</span>
                             </div>
                         </div>
-                        <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); padding: 6px 8px; border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor);">
-                            <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">This Month</div>
-                            <div style="font-size: 16px; font-weight: 600; color: var(--SmartThemeBodyColor);">
-                                <span id="token-usage-month-total">${formatTokens(stats.thisMonth.total)}</span>
+                        <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); overflow: hidden; display: flex;">
+                            <div style="flex: 1; padding: 4px 8px;">
+                                <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">This Month</div>
+                                <div style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-month-total">${formatTokens(stats.thisMonth.total)}</div>
+                            </div>
+                            <div style="width: 1px; background: var(--SmartThemeBorderColor);"></div>
+                            <div style="flex: 1; padding: 4px 8px; display: flex; align-items: center; justify-content: center;">
+                                <span style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-month-cost">$0.00</span>
                             </div>
                         </div>
-                        <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); padding: 6px 8px; border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor);">
-                            <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">All Time</div>
-                            <div style="font-size: 16px; font-weight: 600; color: var(--SmartThemeQuoteColor);">
-                                <span id="token-usage-alltime-total">${formatTokens(stats.allTime.total)}</span>
+                        <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); overflow: hidden; display: flex;">
+                            <div style="flex: 1; padding: 4px 8px;">
+                                <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">All Time</div>
+                                <div style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-alltime-total">${formatTokens(stats.allTime.total)}</div>
+                            </div>
+                            <div style="width: 1px; background: var(--SmartThemeBorderColor);"></div>
+                            <div style="flex: 1; padding: 4px 8px; display: flex; align-items: center; justify-content: center;">
+                                <span style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-alltime-cost">$0.00</span>
                             </div>
                         </div>
                     </div>
 
-                    <!-- Model Colors -->
+                    <!-- Config (Model Colors & Prices) -->
                     <div class="inline-drawer" style="margin-top: 10px;">
                         <div class="inline-drawer-toggle inline-drawer-header" style="padding: 4px 0 4px 8px;">
-                            <span style="font-size: 11px;">Model Colors</span>
+                            <span style="font-size: 11px;">Config</span>
                             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                         </div>
                         <div class="inline-drawer-content">
@@ -1334,7 +1925,7 @@ function createSettingsUI() {
         });
     });
 
-    $('#token-usage-reset-all').on('click', function() {
+    $('#token-usage-reset-all').on('click', function () {
         if (confirm('Are you sure you want to reset ALL token usage data? This cannot be undone.')) {
             resetAllUsage();
             updateUIStats();
