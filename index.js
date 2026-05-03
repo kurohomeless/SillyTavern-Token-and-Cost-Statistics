@@ -208,18 +208,25 @@ function getCurrentModelId() {
  * @param {number} outputTokens - Tokens in the AI response
  * @param {string} [chatId] - Optional chat ID for per-chat tracking
  * @param {string} [modelId] - Optional model ID for per-model tracking
+ * @param {{cost?: number|null, source?: string|null}} [apiUsage] - Optional API-reported usage metadata
  */
-function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null) {
+function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, apiUsage = {}) {
     const settings = getSettings();
     const usage = settings.usage;
     const now = new Date();
     const totalTokens = inputTokens + outputTokens;
+    const exactCost = Number.isFinite(apiUsage?.cost) ? apiUsage.cost : null;
 
     const addTokens = (bucket) => {
         bucket.input = (bucket.input || 0) + inputTokens;
         bucket.output = (bucket.output || 0) + outputTokens;
         bucket.total = (bucket.total || 0) + totalTokens;
         bucket.messageCount = (bucket.messageCount || 0) + 1;
+        if (exactCost !== null) {
+            bucket.cost = (bucket.cost || 0) + exactCost;
+            bucket.costedInput = (bucket.costedInput || 0) + inputTokens;
+            bucket.costedOutput = (bucket.costedOutput || 0) + outputTokens;
+        }
     };
 
     // Session
@@ -243,6 +250,11 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null) {
         modelData.input += inputTokens;
         modelData.output += outputTokens;
         modelData.total += totalTokens;
+        if (exactCost !== null) {
+            modelData.cost = (modelData.cost || 0) + exactCost;
+            modelData.costedInput = (modelData.costedInput || 0) + inputTokens;
+            modelData.costedOutput = (modelData.costedOutput || 0) + outputTokens;
+        }
     }
 
     // By hour
@@ -277,7 +289,8 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null) {
     // Emit custom event for UI updates
     eventSource.emit('tokenUsageUpdated', getUsageStats());
 
-    console.log(`[Token Usage Tracker] Recorded: +${inputTokens} input, +${outputTokens} output, model: ${modelId || 'unknown'} (using ${getFriendlyTokenizerName(main_api).tokenizerName})`);
+    const costLog = exactCost !== null ? `, cost: $${exactCost.toFixed(6)} (${apiUsage.source || 'api'})` : '';
+    console.log(`[Token Usage Tracker] Recorded: +${inputTokens} input, +${outputTokens} output, model: ${modelId || 'unknown'}${costLog} (using ${getFriendlyTokenizerName(main_api).tokenizerName})`);
 }
 
 /**
@@ -368,6 +381,54 @@ function getUsageForRange(startDate, endDate) {
     }
 
     return result;
+}
+
+/**
+ * Extract API-reported token usage saved by SillyTavern core, when available.
+ * Supports OpenAI/OpenRouter, Claude-like, Cohere, and Gemini usage shapes.
+ * @param {any} apiUsage
+ * @returns {{input: number, output: number, total: number, cost: number|null, source: string}|null}
+ */
+function parseApiUsage(apiUsage) {
+    if (!apiUsage || typeof apiUsage !== 'object') return null;
+
+    const readNumber = (...values) => {
+        for (const value of values) {
+            const parsed = Number(value);
+            if (Number.isFinite(parsed)) return parsed;
+        }
+        return null;
+    };
+
+    const input = readNumber(
+        apiUsage.prompt_tokens,
+        apiUsage.input_tokens,
+        apiUsage.promptTokenCount,
+    );
+    const output = readNumber(
+        apiUsage.completion_tokens,
+        apiUsage.output_tokens,
+        apiUsage.candidatesTokenCount,
+    );
+    const total = readNumber(
+        apiUsage.total_tokens,
+        apiUsage.totalTokenCount,
+        input !== null && output !== null ? input + output : null,
+    );
+    const cost = readNumber(
+        apiUsage.cost,
+        apiUsage.cost_details?.upstream_inference_cost,
+    );
+
+    if (input === null && output === null && total === null && cost === null) return null;
+
+    return {
+        input: input || 0,
+        output: output || 0,
+        total: total || (input || 0) + (output || 0),
+        cost,
+        source: 'api_usage',
+    };
 }
 
 /**
@@ -567,29 +628,37 @@ async function handleMessageReceived(messageIndex, type) {
 
         if (!message || !message.mes) return;
 
+        const apiUsage = parseApiUsage(message.extra?.api_usage);
         let outputTokens;
+        let inputTokens;
 
-        // Use SillyTavern's pre-calculated token count if available
-        // This already includes reasoning tokens when power_user.message_token_count_enabled is true
-        if (message.extra?.token_count && typeof message.extra.token_count === 'number') {
-            outputTokens = message.extra.token_count;
-            console.log(`[Token Usage Tracker] Using pre-calculated token count: ${outputTokens}`);
+        if (apiUsage) {
+            inputTokens = apiUsage.input;
+            outputTokens = apiUsage.output || Math.max(0, apiUsage.total - apiUsage.input);
+            console.log(`[Token Usage Tracker] Using API-reported usage: ${inputTokens} in, ${outputTokens} out${apiUsage.cost !== null ? `, $${apiUsage.cost.toFixed(6)}` : ''}`);
         } else {
-            // Fall back to manual counting
-            outputTokens = await countTokens(message.mes);
+            // Use SillyTavern's pre-calculated token count if available.
+            // This already includes reasoning tokens when power_user.message_token_count_enabled is true.
+            if (message.extra?.token_count && typeof message.extra.token_count === 'number') {
+                outputTokens = message.extra.token_count;
+                console.log(`[Token Usage Tracker] Using pre-calculated token count: ${outputTokens}`);
+            } else {
+                // Fall back to manual counting
+                outputTokens = await countTokens(message.mes);
 
-            // Also count reasoning/thinking tokens (from Claude thinking, OpenAI o1, etc.)
-            if (message.extra?.reasoning) {
-                const reasoningTokens = await countTokens(message.extra.reasoning);
-                outputTokens += reasoningTokens;
-                console.log(`[Token Usage Tracker] Including ${reasoningTokens} reasoning tokens`);
+                // Also count reasoning/thinking tokens (from Claude thinking, OpenAI o1, etc.)
+                if (message.extra?.reasoning) {
+                    const reasoningTokens = await countTokens(message.extra.reasoning);
+                    outputTokens += reasoningTokens;
+                    console.log(`[Token Usage Tracker] Including ${reasoningTokens} reasoning tokens`);
+                }
+                console.log(`[Token Usage Tracker] Manually counted tokens: ${outputTokens}`);
             }
-            console.log(`[Token Usage Tracker] Manually counted tokens: ${outputTokens}`);
         }
 
-        // For 'continue' type, we only want the newly generated tokens, not the full message
-        // Subtract the pre-continue token count to get just the delta
-        if (type === 'continue' && preContinueTokenCount > 0) {
+        // For local-tokenizer continue records, subtract the pre-continue count.
+        // API-reported completion tokens already describe the generated response.
+        if (!apiUsage && type === 'continue' && preContinueTokenCount > 0) {
             const originalOutputTokens = outputTokens;
             outputTokens = Math.max(0, outputTokens - preContinueTokenCount);
             console.log(`[Token Usage Tracker] Continue type: ${originalOutputTokens} total - ${preContinueTokenCount} pre-continue = ${outputTokens} new tokens`);
@@ -599,8 +668,13 @@ async function handleMessageReceived(messageIndex, type) {
         const savedPreContinueCount = preContinueTokenCount;
         preContinueTokenCount = 0;
 
-        // Await the input token counting that was started in handleGenerateAfterData
-        const inputTokens = await pendingInputTokensPromise;
+        // Await the fallback input token count only when the API did not report it.
+        if (inputTokens === undefined) {
+            inputTokens = await pendingInputTokensPromise;
+        } else {
+            // Drain the pending promise so any tokenizer error handling has completed.
+            pendingInputTokensPromise.catch(() => {});
+        }
         const modelId = pendingModelId;
         pendingInputTokensPromise = null;
         pendingModelId = null;
@@ -608,7 +682,7 @@ async function handleMessageReceived(messageIndex, type) {
         // Get current chat ID if available
         const chatId = context.chatMetadata?.chat_id || null;
 
-        recordUsage(inputTokens, outputTokens, chatId, modelId);
+        recordUsage(inputTokens, outputTokens, chatId, modelId, apiUsage);
 
         console.log(`[Token Usage Tracker] Recorded exchange: ${inputTokens} in, ${outputTokens} out, model: ${modelId || 'unknown'}${savedPreContinueCount > 0 ? ' (continue delta)' : ''}`);
     } catch (error) {
@@ -1269,6 +1343,15 @@ function calculateCost(inputTokens, outputTokens, modelId) {
     return inputCost + outputCost;
 }
 
+function calculateStoredOrEstimatedCost(data, modelId) {
+    if (!data) return 0;
+
+    const exactCost = Number.isFinite(data.cost) ? data.cost : 0;
+    const residualInput = Math.max(0, (data.input || 0) - (data.costedInput || 0));
+    const residualOutput = Math.max(0, (data.output || 0) - (data.costedOutput || 0));
+    return exactCost + calculateCost(residualInput, residualOutput, modelId);
+}
+
 /**
  * Calculate all-time cost using the byModel aggregation which has precise input/output counts
  */
@@ -1278,9 +1361,7 @@ function calculateAllTimeCost() {
     let total = 0;
 
     for (const [modelId, data] of Object.entries(byModel)) {
-        const inputTokens = data.input || 0;
-        const outputTokens = data.output || 0;
-        const cost = calculateCost(inputTokens, outputTokens, modelId);
+        const cost = calculateStoredOrEstimatedCost(data, modelId);
         total += cost || 0;
     }
     return total;
@@ -1681,9 +1762,7 @@ function updateUIStats() {
             if (data.models) {
                 for (const [mid, modelData] of Object.entries(data.models)) {
                     // modelData is now { input, output, total } (or number for legacy data)
-                    const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
-                    const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
-                    const cost = calculateCost(mInput, mOutput, mid);
+                    const cost = calculateStoredOrEstimatedCost(modelData, mid);
                     weekCost += cost || 0;
                     if (dayKey === todayKey) {
                         todayCost += cost || 0;
@@ -1695,9 +1774,7 @@ function updateUIStats() {
         if (getMonthKey(date) === currentMonthKey) {
             if (data.models) {
                 for (const [mid, modelData] of Object.entries(data.models)) {
-                    const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
-                    const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
-                    const cost = calculateCost(mInput, mOutput, mid);
+                    const cost = calculateStoredOrEstimatedCost(modelData, mid);
                     monthCost += cost || 0;
                 }
             }
