@@ -13,8 +13,7 @@ import { extension_settings, getContext } from '../../../extensions.js';
 import { getTokenCountAsync, getTextTokens, getFriendlyTokenizerName, tokenizers } from '../../../tokenizers.js';
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
-import { getChatCompletionModel, oai_settings } from '../../../openai.js';
-import { textgenerationwebui_settings as textgen_settings } from '../../../textgen-settings.js';
+import { getGeneratingModel } from '../../../../script.js';
 import { pricing } from './dict.js';
 
 const extensionName = 'token-usage-tracker';
@@ -173,32 +172,6 @@ async function countTokens(text) {
         console.error('[Token Usage Tracker] Error counting tokens:', error);
         // Ultimate fallback: character-based estimate
         return Math.ceil(text.length / 3.35);
-    }
-}
-
-/**
- * Get the current model ID based on the active API
- * @returns {string} Model identifier
- */
-function getCurrentModelId() {
-    try {
-        if (main_api === 'openai') {
-            const model = getChatCompletionModel();
-            return model || oai_settings?.custom_model || 'unknown-openai';
-        }
-        if (main_api === 'textgenerationwebui') {
-            return textgen_settings?.model || 'unknown-textgen';
-        }
-        if (main_api === 'novel') {
-            return 'novelai';
-        }
-        if (main_api === 'kobold') {
-            return 'kobold';
-        }
-        return main_api || 'unknown';
-    } catch (e) {
-        console.warn('[Token Usage Tracker] Error getting model ID:', e);
-        return 'unknown';
     }
 }
 
@@ -543,7 +516,7 @@ function handleGenerateAfterData(generate_data, dryRun) {
     if (dryRun) return;
 
     // Capture model ID synchronously (fast)
-    pendingModelId = getCurrentModelId();
+    pendingModelId = getGeneratingModel();
 
     // Start token counting but DON'T await - let it run in parallel with the API request
     pendingInputTokensPromise = countInputTokens(generate_data)
@@ -561,12 +534,19 @@ function handleGenerateAfterData(generate_data, dryRun) {
  * Handle GENERATION_STARTED event - capture pre-continue state
  * This fires before the API call, allowing us to snapshot the current message state
  * for 'continue' type generations so we can calculate the delta later.
- * @param {string} type - Generation type: 'normal', 'continue', 'swipe', 'regenerate', etc.
+ * @param {string} type - Generation type: 'normal', 'continue', 'swipe', 'regenerate', 'quiet', etc.
  * @param {object} params - Generation parameters
  * @param {boolean} isDryRun - Whether this is a dry run
  */
+let isQuietGeneration = false;
+let isImpersonateGeneration = false;
+
 async function handleGenerationStarted(type, params, isDryRun) {
     if (isDryRun) return;
+
+    // Track the generation type for special handling
+    isQuietGeneration = (type === 'quiet');
+    isImpersonateGeneration = (type === 'impersonate');
 
     // Reset pre-continue state
     preContinueTokenCount = 0;
@@ -589,7 +569,6 @@ async function handleGenerationStarted(type, params, isDryRun) {
                     }
                     preContinueTokenCount = tokens;
                 }
-                console.log(`[Token Usage Tracker] Pre-continue token count: ${preContinueTokenCount}`);
             }
         } catch (error) {
             console.error('[Token Usage Tracker] Error capturing pre-continue state:', error);
@@ -609,7 +588,7 @@ async function handleGenerationStarted(type, params, isDryRun) {
 async function handleMessageReceived(messageIndex, type) {
     // Filter out events that don't correspond to actual API calls
     // These events are emitted for messages created without calling the API
-    const nonApiTypes = ['command', 'first_message', 'extension'];
+    const nonApiTypes = ['command', 'first_message'];
     if (nonApiTypes.includes(type)) {
         console.log(`[Token Usage Tracker] Skipping non-API message type: ${type}`);
         return;
@@ -749,8 +728,49 @@ function handleChatChanged(chatId) {
     pendingInputTokensPromise = null;
     pendingModelId = null;
     preContinueTokenCount = 0;
+    isQuietGeneration = false;
+    isImpersonateGeneration = false;
     console.log(`[Token Usage Tracker] Chat changed to: ${chatId}`);
     eventSource.emit('tokenUsageUpdated', getUsageStats());
+}
+
+/**
+ * Handle impersonate ready event - count output tokens for impersonation
+ * This fires when impersonation completes and puts text into the input field
+ * @param {string} text - The generated impersonation text
+ */
+async function handleImpersonateReady(text) {
+    if (!pendingInputTokensPromise) return;
+
+    try {
+
+        // Await the input token counting that was started in handleGenerateAfterData
+        const inputTokens = await pendingInputTokensPromise;
+        const modelId = pendingModelId;
+        pendingInputTokensPromise = null;
+        pendingModelId = null;
+
+        // Count output tokens from the impersonated text
+        let outputTokens = 0;
+        if (text && typeof text === 'string') {
+            outputTokens = await countTokens(text);
+        }
+
+        // Get current chat ID if available
+        const context = getContext();
+        const chatId = context.chatMetadata?.chat_id || null;
+
+        recordUsage(inputTokens, outputTokens, chatId, modelId);
+
+
+        // Reset impersonate state
+        isImpersonateGeneration = false;
+    } catch (error) {
+        console.error('[Token Usage Tracker] Error handling impersonate ready:', error);
+        pendingInputTokensPromise = null;
+        pendingModelId = null;
+        isImpersonateGeneration = false;
+    }
 }
 
 function registerSlashCommands() {
@@ -2038,6 +2058,175 @@ function createSettingsUI() {
     });
 }
 
+/**
+ * Patch SillyTavern's background generation functions to track tokens
+ * - generateQuiet / generate_quiet (Used by Summarize, generated prompts, etc.)
+ * - ConnectionManagerRequestService.sendRequest (Used by extensions like Roadway)
+ */
+let isTrackingBackground = false;
+
+function patchBackgroundGenerations() {
+    patchGenerateQuietPrompt();
+    patchConnectionManager();
+}
+
+function patchGenerateQuietPrompt() {
+    // For quiet generations (Guided Generations, Summarize, Expressions, etc.),
+    // MESSAGE_RECEIVED doesn't fire. Flush pending tokens on next generation or chat change.
+    eventSource.on(event_types.GENERATION_STARTED, async (type, params, dryRun) => {
+        if (dryRun) return;
+        if (isQuietGeneration && pendingInputTokensPromise) {
+            await flushQuietGeneration();
+        }
+    });
+
+    eventSource.on(event_types.CHAT_CHANGED, async () => {
+        if (isQuietGeneration && pendingInputTokensPromise) {
+            await flushQuietGeneration();
+        }
+    });
+}
+
+/**
+ * Flush a pending quiet generation, recording tokens from what we have
+ */
+async function flushQuietGeneration() {
+    if (!pendingInputTokensPromise) return;
+
+    try {
+        const inputTokens = await pendingInputTokensPromise;
+        const modelId = pendingModelId;
+
+        // Try to get output from streaming processor
+        let outputTokens = 0;
+        if (streamingProcessor?.result) {
+            outputTokens = await countTokens(streamingProcessor.result);
+        }
+
+        // Record the usage
+        if (inputTokens > 0 || outputTokens > 0) {
+            recordUsage(inputTokens, outputTokens, null, modelId);
+        }
+    } catch (e) {
+        console.error('[Token Usage Tracker] Error flushing quiet generation:', e);
+    } finally {
+        // Reset state
+        pendingInputTokensPromise = null;
+        pendingModelId = null;
+        isQuietGeneration = false;
+    }
+}
+
+function patchConnectionManager() {
+    // Poll for ConnectionManagerRequestService (used by Roadway and similar extensions)
+    const checkInterval = setInterval(() => {
+        try {
+            const context = getContext();
+            const ServiceClass = context?.ConnectionManagerRequestService;
+
+            if (!ServiceClass || typeof ServiceClass.sendRequest !== 'function') return;
+            if (ServiceClass.sendRequest._isPatched) {
+                clearInterval(checkInterval);
+                return;
+            }
+
+            const originalSendRequest = ServiceClass.sendRequest.bind(ServiceClass);
+
+            ServiceClass.sendRequest = async function(profileId, messages, maxTokens, custom, overridePayload) {
+                if (isTrackingBackground) {
+                    return await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
+                }
+
+                let inputTokens = 0;
+                const modelId = getGeneratingModel();
+
+                try {
+                    isTrackingBackground = true;
+
+                    try {
+                        inputTokens = await countInputTokens({ prompt: messages });
+                    } catch (e) {
+                        console.error('[Token Usage Tracker] Error counting sendRequest input:', e);
+                    }
+
+                    const result = await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
+
+                    try {
+                        let outputTokens = 0;
+                        if (result && typeof result.content === 'string') {
+                            outputTokens = await countTokens(result.content);
+                        } else if (typeof result === 'string') {
+                            outputTokens = await countTokens(result);
+                        }
+
+                        if (outputTokens > 0 || inputTokens > 0) {
+                            recordUsage(inputTokens, outputTokens, null, modelId);
+                        }
+                    } catch (e) {
+                        console.error('[Token Usage Tracker] Error counting sendRequest output:', e);
+                    }
+
+                    return result;
+                } finally {
+                    isTrackingBackground = false;
+                }
+            };
+
+            ServiceClass.sendRequest._isPatched = true;
+            clearInterval(checkInterval);
+        } catch (e) {
+            console.error('[Token Usage Tracker] Error in patchConnectionManager:', e);
+        }
+    }, 1000);
+
+    // Stop polling after 30 seconds
+    setTimeout(() => clearInterval(checkInterval), 30000);
+}
+
+/**
+ * Generic handler for background generations with recursion guard
+ */
+async function handleBackgroundGeneration(originalFn, context, args, inputCounter, outputCounter) {
+    // Avoid double counting if one patched function calls another
+    if (isTrackingBackground) {
+        return await originalFn.apply(context, args);
+    }
+
+    let result;
+    let inputTokens = 0;
+    const modelId = getGeneratingModel();
+
+    try {
+        isTrackingBackground = true;
+
+        // Count input tokens
+        try {
+            inputTokens = await inputCounter();
+            console.log(`[Token Usage Tracker] Counting background input. Tokens: ${inputTokens}`);
+        } catch (e) {
+            console.error('[Token Usage Tracker] Error counting background input:', e);
+        }
+
+        // Execute original
+        result = await originalFn.apply(context, args);
+
+        // Count output tokens
+        try {
+            const outputTokens = await outputCounter(result);
+            if (outputTokens > 0 || inputTokens > 0) {
+                recordUsage(inputTokens, outputTokens, null, modelId);
+                console.log(`[Token Usage Tracker] Background usage recorded: ${inputTokens} in, ${outputTokens} out`);
+            }
+        } catch (e) {
+            console.error('[Token Usage Tracker] Error counting background output:', e);
+        }
+    } finally {
+        isTrackingBackground = false;
+    }
+
+    return result;
+}
+
 jQuery(async () => {
     console.log('[Token Usage Tracker] Initializing...');
 
@@ -2045,12 +2234,16 @@ jQuery(async () => {
     registerSlashCommands();
     createSettingsUI();
 
+    // Attempt to patch background generation functions
+    patchBackgroundGenerations();
+
     // Subscribe to events
     eventSource.on(event_types.GENERATION_STARTED, handleGenerationStarted);
     eventSource.on(event_types.GENERATE_AFTER_DATA, handleGenerateAfterData);
     eventSource.on(event_types.MESSAGE_RECEIVED, handleMessageReceived);
     eventSource.on(event_types.GENERATION_STOPPED, handleGenerationStopped);
     eventSource.on(event_types.CHAT_CHANGED, handleChatChanged);
+    eventSource.on(event_types.IMPERSONATE_READY, handleImpersonateReady);
 
     // Log current tokenizer
     try {
