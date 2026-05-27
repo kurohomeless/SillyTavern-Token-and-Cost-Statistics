@@ -1,32 +1,383 @@
-/* Token Usage Tracker Extension Styles */
+.kuro-ta-container {
+    --ta-mono:
+        ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+        "Liberation Mono", "Courier New", monospace;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding-block: 0.5rem 0;
 
-/* Active state for range buttons */
-.range-btn.active {
-  background-color: white;
-  color: #0f172a; /* slate-900 */
-  box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.05),
-    0 1px 2px 0 rgba(0, 0, 0, 0.05);
+    .kuro-ta-controls {
+        display: flex;
+        gap: 0.25rem;
+        margin-block-end: 0.25rem;
+        flex-wrap: wrap;
+
+        .menu_button {
+            flex: 1;
+            text-align: center;
+            padding: 0.25rem 0.5rem;
+            font-size: 0.75rem;
+            min-width: 2.5rem;
+
+            &.menu_button_active {
+                background-color: var(--SmartThemeBodyColor);
+                font-weight: bold;
+                opacity: 1;
+                border: 1px solid var(--SmartThemeBorderColor);
+
+                /* Safe static color fallback for contrast-color */
+                color: var(--SmartThemeBlurTintColor);
+                color: contrast-color(var(--SmartThemeBodyColor));
+
+                /* Safe static shadow fallback for OKLCH relative colors */
+                box-shadow: inset 0 0 0.25rem rgba(0, 0, 0, 0.3);
+                box-shadow: inset 0 0 0.25rem
+                    oklch(
+                        from var(--SmartThemeBodyColor) calc(l - 0.3) c h / 0.4
+                    );
+
+                outline: 2px solid var(--SmartThemeBorderColor);
+                outline-offset: -3px;
+            }
+        }
+    }
+
+    .kuro-ta-metrics {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 0.5rem;
+
+        @media (min-width: 800px) {
+            grid-template-columns: repeat(4, 1fr);
+        }
+
+        .kuro-ta-metric-card {
+            background: var(--SmartThemeBlurTintColor);
+            border: 1px solid var(--SmartThemeBorderColor);
+            border-radius: 0.375rem;
+            padding: 0.625rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+
+            .kuro-ta-metric-label {
+                font-size: 0.6875rem;
+                
+                /* Safe static fallback for color-mix */
+                color: var(--SmartThemeBodyColor);
+                color: color-mix(
+                    in srgb,
+                    var(--SmartThemeBodyColor) 70%,
+                    transparent
+                );
+                text-transform: uppercase;
+                letter-spacing: 0.03rem;
+            }
+
+            .kuro-ta-metric-value {
+                font-family: var(--ta-mono);
+                font-size: 1.125rem;
+                color: var(--SmartThemeBodyColor);
+                line-height: 1.2;
+            }
+
+            .kuro-ta-metric-sub {
+                font-family: var(--ta-mono);
+                font-size: 0.625rem;
+                color: var(--SmartThemeEmColor);
+                display: flex;
+                justify-content: space-between;
+            }
+        }
+    }
+
+    .kuro-ta-chart-wrapper {
+        background: var(--SmartThemeBlurTintColor);
+        border: 1px solid var(--SmartThemeBorderColor);
+        border-radius: 0.375rem;
+        height: 12.5rem;
+        position: relative;
+        overflow: hidden;
+
+        .kuro-ta-chart-svg {
+            height: 100%;
+            display: block;
+        }
+
+        .kuro-ta-bar-group {
+            cursor: crosshair;
+
+            &:hover .kuro-ta-bar-hover {
+                opacity: 0.1;
+            }
+        }
+
+        .kuro-ta-bar-hover {
+            opacity: 0;
+            transition: opacity 0.1s;
+        }
+
+        /* SVG Inner Custom Styling */
+        .kuro-ta-chart-grid-line {
+            stroke: var(--SmartThemeBodyColor);
+            stroke-dasharray: 2 4;
+            opacity: 0.4;
+        }
+
+        .kuro-ta-chart-grid-text {
+            text-anchor: end;
+            fill: var(--SmartThemeBodyColor);
+            opacity: 0.6;
+            font-family: var(--ta-mono);
+            font-size: 9px;
+        }
+
+        .kuro-ta-chart-bar {
+            stroke: var(--SmartThemeBorderColor);
+            stroke-width: 1;
+            pointer-events: none;
+        }
+
+        .kuro-ta-chart-label-text {
+            text-anchor: middle;
+            fill: var(--SmartThemeBodyColor);
+            opacity: 0.6;
+            font-size: 9px;
+        }
+    }
+
+    .kuro-ta-models-list {
+        max-height: 15rem;
+        overflow-y: auto;
+        scrollbar-width: thin;
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+        padding-inline-end: 0.25rem;
+
+        .kuro-ta-empty-msg {
+            padding: 0.625rem;
+            text-align: center;
+            opacity: 0.5;
+            font-size: 0.6875rem;
+        }
+
+        .kuro-ta-model-row {
+            display: grid;
+            grid-template-columns: auto 1fr auto auto;
+            gap: 0.625rem;
+            align-items: center;
+            padding: 0.375rem 0.5rem;
+            
+            /* Safe fallback backgrounds and borders */
+            background: var(--SmartThemeBlurTintColor);
+            background: color-mix(
+                in srgb,
+                var(--SmartThemeBlurTintColor) 50%,
+                transparent
+            );
+            border: 1px solid var(--SmartThemeBorderColor);
+            border: 1px solid color-mix(
+                in srgb,
+                var(--SmartThemeBorderColor) 50%,
+                transparent
+            );
+            border-radius: 0.25rem;
+        }
+
+        .kuro-ta-color-picker {
+            width: 0.875rem;
+            height: 0.875rem;
+            padding: 0;
+            border: none;
+            border-radius: 0.125rem;
+            cursor: pointer;
+            background: transparent;
+
+            &::-webkit-color-swatch-wrapper {
+                padding: 0;
+            }
+            &::-webkit-color-swatch {
+                border: none;
+                border-radius: 0.125rem;
+            }
+        }
+
+        .kuro-ta-model-name {
+            font-size: 0.75rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .kuro-ta-model-stats {
+            font-family: var(--ta-mono);
+            font-size: 0.625rem;
+            text-align: right;
+            
+            /* Safe fallback model stat colors */
+            color: var(--SmartThemeBodyColor);
+            color: color-mix(
+                in srgb,
+                var(--SmartThemeBodyColor) 80%,
+                transparent
+            );
+
+            .kuro-ta-model-pct {
+                opacity: 0.8;
+                font-size: 0.625rem;
+            }
+        }
+
+        .kuro-ta-price-inputs {
+            display: flex;
+            gap: 0.25rem;
+
+            .kuro-ta-price-input {
+                width: 3.125rem;
+                background: var(--SmartThemeBlurTintColor);
+                border: 1px solid var(--SmartThemeBorderColor);
+                color: var(--SmartThemeBodyColor);
+                font-family: var(--ta-mono);
+                font-size: 0.625rem;
+                padding: 0.25rem;
+                border-radius: 0.1875rem;
+                text-align: right;
+
+                &:focus {
+                    outline: none;
+                    border-color: var(--SmartThemeBlurTintColor);
+                }
+            }
+        }
+    }
+
+    .kuro-ta-sub-drawer-header {
+        font-size: 0.75rem;
+        padding: 0.375rem 0.625rem;
+    }
+
+    .kuro-ta-utils {
+        display: flex;
+        gap: 0.25rem;
+        margin-block-start: 0.25rem;
+
+        .menu_button {
+            flex: 1;
+            text-align: center;
+            font-size: 0.75rem;
+            padding: 0.375rem;
+
+            i {
+                margin-inline-end: 0.5rem;
+            }
+        }
+
+        .kuro-ta-btn-danger {
+            color: #ef4444;
+        }
+
+        .kuro-ta-hidden {
+            display: none !important;
+        }
+    }
 }
 
-/* Transition for the hover cursor rect in the graph */
-.cursor-rect {
-  transition: fill 0.1s;
-}
+#kuro-ta-tooltip {
+    position: fixed;
+    display: none;
+    background: var(--SmartThemeBlurTintColor);
+    backdrop-filter: blur(var(--SmartThemeBlurStrength));
+    -webkit-backdrop-filter: blur(var(--SmartThemeBlurStrength));
+    border: 1px solid var(--SmartThemeBorderColor);
+    color: var(--SmartThemeBodyColor);
+    padding: 0.625rem;
+    border-radius: 0.375rem;
+    z-index: 99999;
+    box-shadow: 0 0.25rem 1rem rgba(0, 0, 0, 0.5);
+    pointer-events: none;
+    min-width: 10rem;
 
-/* Hide number input spin buttons */
-#token-usage-model-colors-grid input[type="number"]::-webkit-outer-spin-button,
-#token-usage-model-colors-grid input[type="number"]::-webkit-inner-spin-button {
-  -webkit-appearance: none;
-  margin: 0;
-}
+    .kuro-ta-tt-header {
+        font-size: 0.6875rem;
+        font-weight: 600;
+        margin-block-end: 0.375rem;
+        padding-block-end: 0.25rem;
+        
+        /* Safe fallback header border line */
+        border-block-end: 1px solid var(--SmartThemeBorderColor);
+        border-block-end: 1px solid color-mix(
+            in srgb,
+            var(--SmartThemeBorderColor) 50%,
+            transparent
+        );
+    }
 
-#token-usage-model-colors-grid input[type="number"] {
-  -moz-appearance: textfield;
-  appearance: textfield;
-}
+    .kuro-ta-tt-row {
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.6875rem;
+        margin-block-end: 0.125rem;
 
-/* Compact model config row */
-.model-config-row {
-  padding: 2px 0;
+        span:first-child {
+            /* Safe fallback key colors */
+            color: var(--SmartThemeBodyColor);
+            color: color-mix(
+                in srgb,
+                var(--SmartThemeBodyColor) 70%,
+                transparent
+            );
+        }
+        span:last-child {
+            font-family: var(--ta-mono);
+        }
+    }
+
+    .kuro-ta-tt-est-warn {
+        color: #eab308;
+        font-size: 0.5625rem;
+        margin-top: 0.25rem;
+    }
+
+    .kuro-ta-tt-models {
+        margin-block-start: 0.375rem;
+        padding-block-start: 0.375rem;
+        
+        /* Safe fallback section divider border */
+        border-block-start: 1px solid var(--SmartThemeBorderColor);
+        border-block-start: 1px solid color-mix(
+            in srgb,
+            var(--SmartThemeBorderColor) 50%,
+            transparent
+        );
+        display: flex;
+        flex-direction: column;
+        gap: 0.1875rem;
+
+        .kuro-ta-tt-model {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            font-size: 0.625rem;
+            font-family: var(--ta-mono);
+
+            .kuro-ta-tt-model-meta {
+                display: flex;
+                align-items: center;
+                overflow: hidden;
+                white-space: nowrap;
+                text-overflow: ellipsis;
+                padding-right: 0.5rem;
+            }
+
+            .kuro-ta-tt-dot {
+                width: 0.375rem;
+                height: 0.375rem;
+                border-radius: 50%;
+                display: inline-block;
+                margin-inline-end: 0.25rem;
+            }
+        }
+    }
 }
