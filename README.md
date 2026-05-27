@@ -6,6 +6,9 @@ An optimized, feature-rich SillyTavern extension that tracks, visualizes, and ca
 
 This repository is a fully modernized fork of the original [Vibecoder9000/Extension-TokenUsage](https://github.com/Vibecoder9000/Extension-TokenUsage), rewritten to align with modern SillyTavern extension standards, improve query performance, and prevent configuration file bloat.
 
+Tested on:
+- [SillyTavern](https://github.com/SillyTavern/SillyTavern)
+- [TauriTavern](https://github.com/Darkatse/TauriTavern)
 ---
 
 ### Author's Note
