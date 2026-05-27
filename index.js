@@ -5,14 +5,14 @@ import {
     streamingProcessor,
     saveSettingsDebounced,
     getGeneratingModel,
-} from "/script.js";
-import { extension_settings, getContext } from "/scripts/extensions.js";
+} from "../../../../script.js";
+import { extension_settings, getContext } from "../../../extensions.js";
 import {
     getTokenCountAsync,
     getTextTokens,
     getFriendlyTokenizerName,
     tokenizers,
-} from "/scripts/tokenizers.js";
+} from "../../../tokenizers.js";
 
 const EXT_KEY = "kuro-token-analytics";
 const moment = window.SillyTavern?.libs?.moment || window.moment;
