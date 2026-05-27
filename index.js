@@ -46,6 +46,23 @@ function isValidModelId(mId) {
 }
 
 /**
+ * Fallback date formatter in case moment library is not bundled on a custom build/fork.
+ */
+function formatDateKey(dateObj, formatStr) {
+    if (moment) {
+        return moment(dateObj).format(formatStr);
+    }
+    const y = dateObj.getFullYear();
+    const m = String(dateObj.getMonth() + 1).padStart(2, "0");
+    const d = String(dateObj.getDate()).padStart(2, "0");
+    const h = String(dateObj.getHours()).padStart(2, "0");
+    if (formatStr === "YYYY-MM-DD[T]HH") return `${y}-${m}-${d}T${h}`;
+    if (formatStr === "YYYY-MM-DD") return `${y}-${m}-${d}`;
+    if (formatStr === "YYYY-MM") return `${y}-${m}`;
+    return `${y}-${m}-${d}`;
+}
+
+/**
  * Normalizes fully-qualified model IDs down to their root name 
  * to allow color & price config sharing across similar model tags.
  */
@@ -485,11 +502,10 @@ function commitRecord(dateObj, modelId, inT, outT, isEst) {
     if (inT === 0 && outT === 0) return;
     if (!isValidModelId(modelId)) return;
 
-    const mDate = moment(dateObj);
     const keys = [
-        { type: "hourly", key: mDate.format("YYYY-MM-DD[T]HH") },
-        { type: "daily", key: mDate.format("YYYY-MM-DD") },
-        { type: "monthly", key: mDate.format("YYYY-MM") },
+        { type: "hourly", key: formatDateKey(dateObj, "YYYY-MM-DD[T]HH") },
+        { type: "daily", key: formatDateKey(dateObj, "YYYY-MM-DD") },
+        { type: "monthly", key: formatDateKey(dateObj, "YYYY-MM") },
     ];
 
     const total = inT + outT;
@@ -571,34 +587,34 @@ function buildDataset(view) {
 
     let targetType = "daily";
     let keysToFetch = [];
-    const nowMoment = moment();
 
     if (view === "24H") {
         targetType = "hourly";
         for (let i = 23; i >= 0; i--) {
-            const d = nowMoment.clone().subtract(i, 'hours');
+            const d = new Date(Date.now() - i * 3600000);
             keysToFetch.push({
-                key: d.format("YYYY-MM-DD[T]HH"),
-                label: d.format("HH:00"),
+                key: formatDateKey(d, "YYYY-MM-DD[T]HH"),
+                label: formatDateKey(d, "HH:00"),
             });
         }
     } else if (view === "7D" || view === "30D") {
         targetType = "daily";
         const days = view === "7D" ? 7 : 30;
         for (let i = days - 1; i >= 0; i--) {
-            const d = nowMoment.clone().subtract(i, 'days');
+            const d = new Date(Date.now() - i * 86400000);
             keysToFetch.push({
-                key: d.format("YYYY-MM-DD"),
-                label: d.format("MM/DD"),
+                key: formatDateKey(d, "YYYY-MM-DD"),
+                label: formatDateKey(d, "MM/DD"),
             });
         }
     } else if (view === "1Y") {
         targetType = "monthly";
+        const now = new Date();
         for (let i = 11; i >= 0; i--) {
-            const d = nowMoment.clone().subtract(i, 'months');
+            const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
             keysToFetch.push({
-                key: d.format("YYYY-MM"),
-                label: d.format("MMM"),
+                key: formatDateKey(d, "YYYY-MM"),
+                label: formatDateKey(d, "MMM"),
             });
         }
     } else if (view === "ALL") {
@@ -609,7 +625,7 @@ function buildDataset(view) {
         );
         const sortedYears = Array.from(years).sort();
         if (sortedYears.length === 0)
-            sortedYears.push(nowMoment.format("YYYY"));
+            sortedYears.push(formatDateKey(new Date(), "YYYY"));
         keysToFetch = sortedYears.map((y) => ({
             key: y,
             label: y,
@@ -1145,11 +1161,11 @@ function injectUI() {
     globalResizeObserver.observe(document.getElementById("kuro-ta-chart"));
 }
 
-// --- SillyTavern UI Extension LifeCycle hook ---
+// --- Initialization / Bootstrap ---
 
 const handleUpdate = () => renderUI();
 
-export async function onActivate() {
+async function init() {
     initDB();
     
     // Register background patching hooks
@@ -1179,9 +1195,24 @@ export async function onActivate() {
         unpatchConnectionManager();
     };
 
-    // Safely defer asynchronous DOM layout loading until SillyTavern unblocks
-    eventSource.on(event_types.APP_READY, () => {
+    // Safely load UI elements when browser or webview interface is ready
+    if (document.getElementById("extensions_settings") || document.getElementById("extensions_settings2")) {
         injectUI();
         renderUI();
-    });
+    } else {
+        eventSource.on(event_types.APP_READY, () => {
+            injectUI();
+            renderUI();
+        });
+    }
+}
+
+// Self-initialize for third-party loading environments (where manifest hooks do not fire)
+jQuery(async () => {
+    await init();
+});
+
+// Exported standard lifecycle hook for native/built-in environments
+export async function onActivate() {
+    await init();
 }
